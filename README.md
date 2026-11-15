@@ -100,7 +100,8 @@ you change things locally.
 
 Nothing changes: use tmux and Claude as usual. Things worth knowing:
 
-- `claude-keeper status`: units, last save, what would come back.
+- `claude-keeper status`: installed commit and date, whether updates exist,
+  units, last save, what would come back.
 - `tmux-keeper show`: the saved pane → session map and the background list.
 - To start clean after a reboot on purpose: `tmux kill-server`, then delete
   `~/.local/share/tmux/resurrect/last`.

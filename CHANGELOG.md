@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `claude-keeper status` and `version` show the installed commit's date and
+  subject; `status` also shows when it was installed and whether GitHub has
+  newer commits.
+
 ## 1.0.0 (2026-11-15)
 
 First packaged release of tools that ran on four machines from 2026-11-14:

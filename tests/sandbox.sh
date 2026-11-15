@@ -72,6 +72,8 @@ check "list-keys shows it" sh -c 'claude-keeper list-keys | grep -q test-dash@bo
 check "remove-key" claude-keeper remove-key test-dash@box
 check "key gone" sh -c '! grep -q test-dash "$HOME/.ssh/authorized_keys"'
 
+check "status shows install time and updates" sh -c 'claude-keeper status | grep -q "^installed:" && claude-keeper status | grep -q "^updates:"'
+
 # update from a git checkout without upstream: reinstalls what is there
 check "update without upstream" sh -c 'claude-keeper update 2>&1 | grep -q "no upstream\|up to date"'
 

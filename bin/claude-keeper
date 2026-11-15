@@ -23,13 +23,36 @@ field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sy
 
 cmd_version() {
   [ -f "$INSTALLED" ] || die "not installed (no $INSTALLED)"
-  local c; c="$(field commit)"
-  printf 'claude-keeper %s%s\n' "$(field version)" "${c:+ ($c$( [ "$(field dirty)" = True ] && echo ', modified'))}"
+  local c src info=""; c="$(field commit)"; src="$(field source)"
+  # Date and subject of the installed commit, if the checkout still has it.
+  [ -n "$c" ] && [ -n "$src" ] && info="$(git -C "$src" log -1 --format='%cs "%s"' "$c" 2>/dev/null || true)"
+  printf 'claude-keeper %s%s\n' "$(field version)" \
+    "${c:+ ($c${info:+, $info}$( [ "$(field dirty)" = True ] && echo ', modified'))}"
+}
+
+cmd_updates() {
+  local src="$1" n
+  [ -n "$src" ] && [ -d "$src/.git" ] || { echo "updates:  unknown (no source checkout)"; return 0; }
+  if ! git -C "$src" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    echo "updates:  not tracked (checkout has no upstream branch)"; return 0
+  fi
+  if ! GIT_TERMINAL_PROMPT=0 timeout 15 git -C "$src" fetch -q 2>/dev/null; then
+    echo "updates:  couldn't check (fetch failed)"; return 0
+  fi
+  n="$(git -C "$src" rev-list --count "$(field commit)..@{u}" 2>/dev/null || echo '?')"
+  case "$n" in
+    0) echo "updates:  up to date" ;;
+    1) echo "updates:  1 newer commit, run claude-keeper update" ;;
+    *) echo "updates:  $n newer commits, run claude-keeper update" ;;
+  esac
 }
 
 cmd_status() {
   cmd_version
   local src; src="$(field source)"
+  local at; at="$(field installedAt)"
+  printf 'installed: %s\n' "$(date -d "$at" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "${at:-?}")"
+  cmd_updates "$src"
   printf 'source:   %s\n' "${src:-?}"
   if [ -n "$src" ] && [ -f "$src/VERSION" ] && [ "$(cat "$src/VERSION")" != "$(field version)" ]; then
     printf '          checkout is at %s: run claude-keeper update\n' "$(cat "$src/VERSION")"
