@@ -46,7 +46,10 @@ cmd_status() {
     printf 'tmux:     no server running\n'
   fi
   local last="$HOME/.local/share/tmux/resurrect/last"
-  [ -e "$last" ] && printf 'last save: %s\n' "$(date -r "$last" '+%Y-%m-%d %H:%M:%S')"
+  # resurrect keeps the previous file when nothing changed, so this is the last *change*.
+  [ -e "$last" ] && printf 'layout:   last changed %s\n' "$(date -r "$last" '+%Y-%m-%d %H:%M:%S')"
+  local t; t="$(systemctl --user show tmux-keeper-save.service -p ExecMainExitTimestamp --value 2>/dev/null || true)"
+  [ -n "$t" ] && printf 'last tick: %s\n' "$t"
   python3 - "$HOME/.local/state/tmux-keeper" <<'PY'
 import json, os, sys
 d = sys.argv[1]
