@@ -29,7 +29,7 @@ Python scripts.
 ## Install
 
 ```bash
-git clone <this repo's URL> ~/.local/src/claude-keeper
+git clone https://github.com/formless63/claude-keeper ~/.local/src/claude-keeper
 ~/.local/src/claude-keeper/install.sh --dry-run   # see what it will change
 ~/.local/src/claude-keeper/install.sh
 claude-keeper status
