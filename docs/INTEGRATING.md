@@ -31,7 +31,7 @@ your app ──SSH (its own key, forced command)──▶ host: claude-mgr ─�
 3. Have the app generate a key pair for this host (below) and show the
    `authorized_keys` line. On the host:
    `claude-keeper add-key 'command="~/.local/bin/claude-mgr",restrict ssh-ed25519 AAAA… myapp@host'`.
-   You can limit where it may connect from by adding `,from="192.168.1.10"`
+   You can limit where it may connect from by adding `,from="192.0.2.10"`
    after `restrict`.
 4. Revoke at any time: `claude-keeper remove-key myapp@host`.
 
