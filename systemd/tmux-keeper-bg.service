@@ -1,0 +1,15 @@
+[Unit]
+Description=tmux-keeper: respawn Claude Code background sessions that were running before reboot
+
+[Service]
+# The Claude supervisor that respawn starts stays in this unit's cgroup, so
+# the unit stays "active (exited)". Don't restart it: stopping it stops the
+# supervisor and every background session. Re-run `tmux-keeper respawn-bg`.
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/locale
+ExecStart=%h/.local/bin/tmux-keeper respawn-bg
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=default.target

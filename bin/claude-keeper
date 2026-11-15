@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# claude-keeper: manage an install of claude-keeper (tmux-keeper + claude-mgr).
+#
+#   claude-keeper status                 what is installed, running and saved
+#   claude-keeper update [--dry-run]     git pull the source checkout, then re-run its install.sh
+#   claude-keeper add-key [LINE]         authorize a dashboard's key for claude-mgr only
+#                                        (LINE or stdin: command="~/.local/bin/claude-mgr",restrict ssh-... comment)
+#   claude-keeper list-keys              keys that may run claude-mgr
+#   claude-keeper remove-key COMMENT     revoke the claude-mgr key(s) with that comment
+#   claude-keeper uninstall [--purge]    remove scripts, units and the ~/.tmux.conf line
+#                                        (--purge also deletes saved state); tmux sessions keep running
+#   claude-keeper version
+set -euo pipefail
+
+STATE="$HOME/.local/state/claude-keeper"
+INSTALLED="$STATE/installed.json"
+AUTH="$HOME/.ssh/authorized_keys"
+FORCED='command="~/.local/bin/claude-mgr",restrict'
+UNITS="$HOME/.config/systemd/user"
+
+die() { printf 'claude-keeper: %s\n' "$*" >&2; exit 1; }
+field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$INSTALLED" "$1" 2>/dev/null || true; }
+
+cmd_version() {
+  [ -f "$INSTALLED" ] || die "not installed (no $INSTALLED)"
+  local c; c="$(field commit)"
+  printf 'claude-keeper %s%s\n' "$(field version)" "${c:+ ($c$( [ "$(field dirty)" = True ] && echo ', modified'))}"
+}
+
+cmd_status() {
+  cmd_version
+  local src; src="$(field source)"
+  printf 'source:   %s\n' "${src:-?}"
+  if [ -n "$src" ] && [ -f "$src/VERSION" ] && [ "$(cat "$src/VERSION")" != "$(field version)" ]; then
+    printf '          checkout is at %s: run claude-keeper update\n' "$(cat "$src/VERSION")"
+  fi
+  printf 'linger:   %s\n' "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo ?)"
+  local u
+  for u in tmux-server.service tmux-keeper-save.timer tmux-keeper-bg.service; do
+    printf '%-26s %s, %s\n' "$u" "$(systemctl --user is-enabled "$u" 2>/dev/null || true)" \
+      "$(systemctl --user is-active "$u" 2>/dev/null || true)"
+  done
+  if env -u TMUX tmux ls >/dev/null 2>&1; then
+    printf 'tmux:     %s session(s) on the default server\n' "$(env -u TMUX tmux ls | wc -l)"
+  else
+    printf 'tmux:     no server running\n'
+  fi
+  local last="$HOME/.local/share/tmux/resurrect/last"
+  [ -e "$last" ] && printf 'last save: %s\n' "$(date -r "$last" '+%Y-%m-%d %H:%M:%S')"
+  python3 - "$HOME/.local/state/tmux-keeper" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+def load(n):
+    try: return json.load(open(os.path.join(d, n)))
+    except (OSError, ValueError): return None
+m, b = load("claude.json"), load("bg.json")
+print("saved:    %d Claude pane(s), %d background session(s)" % (
+    len((m or {}).get("panes", [])), len((b or {}).get("sessions", []))))
+PY
+  [ -e "$HOME/.config/tmux-keeper/no-autopin" ] && echo "auto-pin: off (~/.config/tmux-keeper/no-autopin)" || echo "auto-pin: on"
+  printf 'dashboard keys: %s\n' "$(grep -cF "$FORCED" "$AUTH" 2>/dev/null || echo 0)"
+}
+
+cmd_update() {
+  [ -f "$INSTALLED" ] || die "not installed; run install.sh from a checkout first"
+  local src; src="$(field source)"
+  [ -n "$src" ] && [ -x "$src/install.sh" ] || die "source checkout '$src' is gone; clone it again and run its install.sh"
+  if git -C "$src" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    if [ "${1:-}" = --dry-run ]; then
+      git -C "$src" fetch -q && git -C "$src" log --oneline 'HEAD..@{u}'
+    else
+      git -C "$src" pull -q --ff-only || die "git pull failed in $src (local changes or diverged history); fix it there, then rerun"
+    fi
+  else
+    echo "$src has no upstream branch: installing what is checked out."
+  fi
+  exec "$src/install.sh" --update "$@"
+}
+
+cmd_add_key() {
+  local line="${1:-}"
+  [ -n "$line" ] || IFS= read -r line || true
+  # Only a key forced to claude-mgr, optionally limited to source addresses.
+  if ! printf '%s' "$line" | grep -qE '^command="~/\.local/bin/claude-mgr",restrict(,from="[^"]*")? (ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|ssh-rsa) [A-Za-z0-9+/=]+( [^"]*)?$'; then
+    die "refusing: the line must start with $FORCED followed by one public key"
+  fi
+  local blob; blob="$(printf '%s' "$line" | sed -E 's/^.*restrict(,from="[^"]*")? //' | awk '{print $2}')"
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  if [ -f "$AUTH" ] && grep -qF "$blob" "$AUTH"; then echo "that key is already in $AUTH"; return 0; fi
+  [ -f "$AUTH" ] && cp -p "$AUTH" "$AUTH.bak-$(date +%Y%m%d-%H%M%S)-claude-keeper"
+  printf '%s\n' "$line" >> "$AUTH"
+  chmod 600 "$AUTH"
+  echo "added: $(printf '%s' "$line" | awk '{print $NF}') (it can run claude-mgr and nothing else)"
+}
+
+cmd_list_keys() {
+  [ -f "$AUTH" ] || { echo "no $AUTH"; return 0; }
+  grep -F "$FORCED" "$AUTH" | while IFS= read -r l; do
+    printf '%s\n' "$l" | sed -E 's/^command="[^"]*",restrict(,from="[^"]*")? //' | ssh-keygen -lf - 2>/dev/null || echo "(unparsable line)"
+  done
+}
+
+cmd_remove_key() {
+  local comment="${1:?usage: claude-keeper remove-key COMMENT}"
+  [ -f "$AUTH" ] || die "no $AUTH"
+  local n; n="$(grep -F "$FORCED" "$AUTH" | awk -v c="$comment" '$NF == c' | wc -l)"
+  [ "$n" -gt 0 ] || die "no claude-mgr key with comment '$comment' (see: claude-keeper list-keys)"
+  cp -p "$AUTH" "$AUTH.bak-$(date +%Y%m%d-%H%M%S)-claude-keeper"
+  awk -v f="$FORCED" -v c="$comment" '!(index($0, f) == 1 && $NF == c)' "$AUTH" > "$AUTH.tmp.$$"
+  chmod 600 "$AUTH.tmp.$$" && mv "$AUTH.tmp.$$" "$AUTH"
+  echo "removed $n key(s) '$comment'"
+}
+
+cmd_uninstall() {
+  local purge=0; [ "${1:-}" = --purge ] && purge=1
+  systemctl --user disable --now tmux-keeper-save.timer 2>/dev/null || true
+  # Disabling tmux-server.service doesn't stop it: your sessions keep running.
+  systemctl --user disable tmux-server.service tmux-keeper-bg.service 2>/dev/null || true
+  rm -f "$UNITS"/{tmux-server.service,tmux-keeper-save.service,tmux-keeper-save.timer,tmux-keeper-bg.service}
+  rm -f "$UNITS/tmux-spawn-.scope.d/50-tmux-keeper.conf"
+  rmdir "$UNITS/tmux-spawn-.scope.d" 2>/dev/null || true
+  systemctl --user daemon-reload 2>/dev/null || true
+  if [ -f "$HOME/.tmux.conf" ]; then
+    cp -p "$HOME/.tmux.conf" "$HOME/.tmux.conf.bak-$(date +%Y%m%d-%H%M%S)-claude-keeper"
+    grep -vxF -e 'source-file ~/.config/tmux/keeper.conf' -e '# claude-keeper (keep this last)' \
+      "$HOME/.tmux.conf" > "$HOME/.tmux.conf.tmp.$$" || true
+    mv "$HOME/.tmux.conf.tmp.$$" "$HOME/.tmux.conf"
+  fi
+  rm -f "$HOME/.config/tmux/keeper.conf" "$HOME/.local/bin/tmux-keeper" "$HOME/.local/bin/claude-mgr"
+  echo "Removed scripts, units and the ~/.tmux.conf line. Kept: ~/.tmux/plugins (TPM's), authorized keys"
+  echo "(claude-keeper list-keys; they stop working now that claude-mgr is gone)."
+  if [ "$purge" = 1 ]; then
+    rm -rf "$HOME/.local/state/tmux-keeper" "$STATE"
+    echo "Deleted saved state."
+  else
+    rm -f "$INSTALLED"
+    echo "Saved state kept in ~/.local/state/tmux-keeper (use --purge to delete it)."
+  fi
+  rm -f "$HOME/.local/bin/claude-keeper"
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  update) shift; cmd_update "$@" ;;
+  add-key) shift; cmd_add_key "$@" ;;
+  list-keys) cmd_list_keys ;;
+  remove-key) shift; cmd_remove_key "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  version|--version) cmd_version ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; [ -z "${1:-}" ] || [ "$1" = -h ] || [ "$1" = --help ] || exit 2 ;;
+esac

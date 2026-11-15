@@ -1,0 +1,19 @@
+[Unit]
+Description=tmux server (detached), restored by tmux-continuum
+# Not "tmux.service": continuum disables a unit of that name whenever
+# @continuum-boot is off.
+Documentation=man:tmux(1)
+
+[Service]
+Type=forking
+EnvironmentFile=-/etc/default/locale
+# Unnamed session "0": resurrect kills it after restoring from scratch.
+ExecStart=tmux new-session -d
+# Save before the server goes away, while Claude processes are still alive.
+ExecStop=%h/.local/bin/tmux-keeper tick
+ExecStop=tmux kill-server
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

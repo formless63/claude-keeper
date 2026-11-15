@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""tmux-keeper: the Claude Code layer on top of tmux-resurrect/continuum.
+
+tmux-resurrect restores sessions, windows, panes, layouts and working dirs.
+It cannot know which Claude conversation ran in which pane, and would start a
+fresh `claude` at best. This fills that gap:
+
+  tmux-keeper save     record pane -> Claude session id (resurrect post-save hook)
+  tmux-keeper resume   run `claude --resume <id>` in those panes (post-restore hook)
+  tmux-keeper tick     run a resurrect save if a tmux server is up (systemd timer;
+                       continuum only autosaves while a client is attached), and
+                       record live Claude background sessions (save-bg)
+  tmux-keeper save-bg  record which `claude --bg` sessions are running
+  tmux-keeper respawn-bg   at boot: `claude respawn <id>` for each of them
+  tmux-keeper show     print the saved maps
+
+Background sessions (`claude --bg`, `/bg`, agent view) survive closed terminals
+and supervisor restarts but not a reboot: afterwards they are listed but not
+running. Only sessions that were live at the last save come back, so one you
+ended with `claude stop` stays stopped (allow one save interval, 2 min).
+save-bg also pins each new background session once (auto-pin), so idle ones
+aren't stopped after ~8 h; unpinning sticks. Opt out: ~/.config/tmux-keeper/no-autopin.
+
+Claude panes come from ~/.claude/sessions/<pid>.json, which Claude Code writes
+for each live interactive session (sessionId, cwd, tmux pane id).
+
+Safety:
+  * save never replaces the map with a smaller one while the system is
+    stopping, and does nothing for 3 minutes after a resume (the resumed
+    Claudes haven't registered yet). The previous map is kept as claude.prev.json.
+  * resume only types into a pane whose current command is a plain shell and
+    whose cwd matches, and never into a pane already running Claude.
+"""
+import json, os, shlex, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("TMUX_KEEPER_STATE", os.path.join(HOME, ".local/state/tmux-keeper"))
+MAP = os.path.join(STATE, "claude.json")
+PREV = os.path.join(STATE, "claude.prev.json")
+MARK = os.path.join(STATE, "resumed")
+BG = os.path.join(STATE, "bg.json")
+SEEN = os.path.join(STATE, "autopin-seen.json")
+PINS = os.path.join(HOME, ".claude/jobs/pins.json")
+NO_AUTOPIN = os.path.join(HOME, ".config/tmux-keeper/no-autopin")
+CLAUDE_SESSIONS = os.path.join(HOME, ".claude/sessions")
+RESURRECT_SAVE = os.path.join(HOME, ".tmux/plugins/tmux-resurrect/scripts/save.sh")
+SHELLS = {"bash", "zsh", "sh", "fish", "dash"}
+SEP = "\x1f"
+
+# Claude flags whose next token is a value. Anything else not starting with "-"
+# is a positional prompt and is dropped (it would be sent again).
+VALUE_FLAGS = {
+    "--add-dir", "--agent", "--agents", "--allowedTools", "--allowed-tools",
+    "--append-system-prompt", "--append-system-prompt-file", "--autocompact",
+    "--betas", "--debug-file", "--disallowedTools", "--disallowed-tools",
+    "--effort", "--fallback-model", "--mcp-config", "--model", "--permission-mode",
+    "--plugin-dir", "--plugin-url", "--settings", "--setting-sources",
+    "--system-prompt", "--system-prompt-file", "--remote-control-session-name-prefix",
+}
+DROP_FLAGS = {"-c", "--continue", "--fork-session", "-p", "--print", "--bg", "--background"}
+DROP_VALUE_FLAGS = {"-r", "--resume", "--session-id", "-n", "--name", "--from-pr"}
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def claude_args(pid):
+    """Original claude argv minus session selection and positional prompts."""
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+    except OSError:
+        return []
+    argv = [a.decode(errors="replace") for a in raw if a]
+    start = next((i + 1 for i, a in enumerate(argv) if os.path.basename(a) in ("claude", "cli.js")), 1)
+    out, rest, i = [], argv[start:], 0
+    while i < len(rest):
+        a = rest[i]
+        name = a.split("=", 1)[0]
+        if name in DROP_FLAGS:
+            i += 1
+        elif name in DROP_VALUE_FLAGS:
+            i += 1 if "=" in a else 2
+        elif name in VALUE_FLAGS:
+            n = 1 if "=" in a else 2
+            out.extend(rest[i:i + n]); i += n
+        elif a.startswith("-"):
+            out.append(a); i += 1
+        else:
+            i += 1
+    return out
+
+
+def live_claude_by_pane():
+    found = {}
+    try:
+        names = os.listdir(CLAUDE_SESSIONS)
+    except FileNotFoundError:
+        return found
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        try:
+            d = json.load(open(os.path.join(CLAUDE_SESSIONS, n)))
+        except (OSError, ValueError):
+            continue
+        pid, tm, sid = d.get("pid"), d.get("tmux") or "", d.get("sessionId")
+        if not (isinstance(pid, int) and sid and "%" in tm and d.get("kind", "interactive") == "interactive"):
+            continue
+        if not pid_alive(pid):
+            continue
+        pane = "%" + tm.rsplit("%", 1)[1]
+        if pane in found and found[pane]["updatedAt"] >= d.get("updatedAt", 0):
+            continue
+        found[pane] = {"sessionId": sid, "pid": pid, "updatedAt": d.get("updatedAt", 0),
+                       "name": d.get("name") if d.get("nameSource") == "user" else None}
+    return found
+
+
+def panes():
+    fmt = SEP.join(["#{pane_id}", "#{session_name}", "#{window_index}", "#{pane_index}",
+                    "#{pane_current_path}", "#{pane_current_command}"])
+    r = tmux("list-panes", "-a", "-F", fmt)
+    if r.returncode != 0:
+        return None
+    out = {}
+    for ln in r.stdout.splitlines():
+        # tmux < 3.5 prints control characters in formats as octal escapes ("\037").
+        pid, s, w, p, cwd, cmd = ln.replace("\\037", SEP).split(SEP)
+        out[pid] = {"target": f"{s}:{w}.{p}", "cwd": cwd, "command": cmd}
+    return out
+
+
+def read_map(path=MAP):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return None
+
+
+def stopping():
+    r = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True)
+    return r.stdout.strip() == "stopping"
+
+
+def save():
+    try:
+        if time.time() - os.path.getmtime(MARK) < 180:
+            return 0
+    except OSError:
+        pass
+    ps = panes()
+    if not ps:
+        return 0  # no server: keep what we have
+    live = live_claude_by_pane()
+    entries = []
+    for pane_id, c in live.items():
+        p = ps.get(pane_id)
+        if not p:
+            continue
+        entries.append({"target": p["target"], "cwd": p["cwd"], "sessionId": c["sessionId"],
+                        "name": c["name"], "args": claude_args(c["pid"])})
+    entries.sort(key=lambda e: e["target"])
+    old = read_map()
+    if old is not None:
+        if old.get("panes") == entries:
+            return 0
+        if stopping() and len(entries) < len(old.get("panes", [])):
+            print("tmux-keeper: stopping and fewer Claude panes than saved; keeping old map")
+            return 0
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    if old is not None:
+        os.replace(MAP, PREV)
+    tmp = MAP + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"saved": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "panes": entries}, f, indent=1)
+    os.replace(tmp, MAP)
+    print(f"tmux-keeper: saved {len(entries)} Claude panes")
+    return 0
+
+
+def claude_cmd(e):
+    parts = [claude_bin(), "--resume", e["sessionId"], *e.get("args", [])]
+    if e.get("name"):
+        parts += ["--name", e["name"]]
+    return shlex.join(parts)
+
+
+def resume():
+    m = read_map()
+    if not m:
+        print("tmux-keeper: no Claude map"); return 0
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    open(MARK, "w").write(time.strftime("%Y-%m-%dT%H:%M:%S%z\n"))
+    # Restored panes may briefly run something else (resurrect replays saved
+    # pane contents with `cat`); give them up to 20 s to settle on a shell.
+    wanted = {e["target"] for e in m.get("panes", [])}
+    for _ in range(40):
+        ps = panes() or {}
+        by_target = {p["target"]: (pid, p) for pid, p in ps.items()}
+        if all(t in by_target and by_target[t][1]["command"] in SHELLS for t in wanted):
+            break
+        time.sleep(0.5)
+    busy = set(live_claude_by_pane())
+    delay = float(os.environ.get("TMUX_KEEPER_CLAUDE_DELAY", "1.5"))
+    done = 0
+    for e in m.get("panes", []):
+        hit = by_target.get(e["target"])
+        if not hit:
+            print(f"skip {e['target']}: pane not found"); continue
+        pid, p = hit
+        if pid in busy:
+            print(f"skip {e['target']}: Claude already running"); continue
+        if p["command"] not in SHELLS:
+            print(f"skip {e['target']}: running {p['command']}, not a shell"); continue
+        if os.path.realpath(p["cwd"]) != os.path.realpath(e["cwd"]):
+            print(f"skip {e['target']}: cwd {p['cwd']} != {e['cwd']}"); continue
+        tmux("send-keys", "-t", pid, claude_cmd(e), "Enter")
+        done += 1
+        time.sleep(delay)
+    print(f"tmux-keeper: resumed {done} Claude sessions")
+    return 0
+
+
+def claude_bin():
+    local = os.path.join(HOME, ".local/bin/claude")
+    return os.environ.get("TMUX_KEEPER_CLAUDE") or (local if os.access(local, os.X_OK) else "claude")
+
+
+def uptime():
+    try:
+        return float(open("/proc/uptime").read().split()[0])
+    except OSError:
+        return 1e9
+
+
+def agents(all_=False):
+    """`claude agents --json` (documented for scripting; doesn't start the supervisor)."""
+    cmd = [claude_bin(), "agents", "--json"] + (["--all"] if all_ else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def autopin(live_ids):
+    """Pin each background session once, the first time it is seen running.
+
+    Unpinned background sessions are stopped after ~8 h idle; pinned ones keep
+    running (and so get respawned after a reboot) until stopped by hand. A
+    session is only ever pinned on first sight, so unpinning it (agent view,
+    claude-mgr) sticks. Opt out per host: touch ~/.config/tmux-keeper/no-autopin.
+    Writes ~/.claude/jobs/pins.json, the list agent view's Ctrl+T writes; a
+    direct edit is honoured by the supervisor (tested with Claude Code 2.1.32x).
+    """
+    if os.path.exists(NO_AUTOPIN):
+        return
+    seen = set(read_map(SEEN) or [])
+    new = [i for i in live_ids if i not in seen]
+    if not new:
+        return
+    try:
+        pins = [p for p in json.load(open(PINS)) if isinstance(p, str)]
+    except FileNotFoundError:
+        pins = []
+    except (OSError, ValueError):
+        return  # unreadable: leave the supervisor's file alone
+    added = [i for i in new if i not in pins]
+    if added:
+        os.makedirs(os.path.dirname(PINS), exist_ok=True)
+        tmp = f"{PINS}.tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(pins + added, f, indent=2)
+        os.replace(tmp, PINS)
+        print(f"tmux-keeper: auto-pinned {', '.join(added)}")
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    tmp = SEEN + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(seen | set(new)), f)
+    os.replace(tmp, SEEN)
+
+
+def save_bg():
+    # Within 5 min of boot the respawn may not have finished; while stopping,
+    # sessions die before we run. Neither state may shrink the list.
+    if uptime() < 300:
+        return 0
+    d = agents()
+    if d is None:
+        return 0
+    live = sorted(({"id": a["id"], "name": a.get("name"), "cwd": a.get("cwd"),
+                    "sessionId": a.get("sessionId")}
+                   for a in d if a.get("kind") == "background" and a.get("id") and a.get("pid")),
+                  key=lambda a: a["id"])
+    if not stopping():
+        autopin([a["id"] for a in live])
+    old = read_map(BG)
+    if old is not None:
+        if old.get("sessions") == live:
+            return 0
+        if stopping() and len(live) < len(old.get("sessions", [])):
+            return 0
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    tmp = BG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"saved": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "sessions": live}, f, indent=1)
+    os.replace(tmp, BG)
+    print(f"tmux-keeper: {len(live)} live background sessions")
+    return 0
+
+
+def respawn_bg():
+    m = read_map(BG)
+    if not m or not m.get("sessions"):
+        print("tmux-keeper: no background sessions to respawn"); return 0
+    want = {s["id"]: s for s in m["sessions"]}
+    # Network and auth may lag behind the user manager at boot: retry.
+    for _ in range(10):
+        d = agents(all_=True) or []
+        live = {a.get("id") for a in d if a.get("kind") == "background" and a.get("pid")}
+        todo = [i for i in want if i not in live]
+        if not todo:
+            print(f"tmux-keeper: all {len(want)} background sessions running"); return 0
+        for i in todo:
+            r = subprocess.run([claude_bin(), "respawn", i], capture_output=True, text=True, timeout=120)
+            print(f"respawn {i} ({want[i].get('name')}): rc={r.returncode} {(r.stdout + r.stderr).strip()[-120:]}")
+        time.sleep(15)
+    return 1
+
+
+def tick():
+    # tmux first: at shutdown (tmux-server.service ExecStop) every millisecond
+    # counts, and save_bg's `claude agents` call takes a few hundred.
+    rc = 0
+    if tmux("has-session").returncode == 0 and os.access(RESURRECT_SAVE, os.X_OK):
+        # resurrect's post-save hook calls `tmux-keeper save`
+        rc = subprocess.run([RESURRECT_SAVE, "quiet"]).returncode
+    save_bg()
+    return rc
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "show"
+    if cmd == "save":
+        return save()
+    if cmd == "resume":
+        return resume()
+    if cmd == "tick":
+        return tick()
+    if cmd == "save-bg":
+        return save_bg()
+    if cmd == "respawn-bg":
+        return respawn_bg()
+    if cmd == "show":
+        m, b = read_map(), read_map(BG)
+        print(json.dumps(m, indent=1) if m else "no Claude pane map")
+        print(json.dumps(b, indent=1) if b else "no background-session list"); return 0
+    print(__doc__); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

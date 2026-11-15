@@ -1,0 +1,6 @@
+[Unit]
+Description=tmux-keeper: resurrect save + Claude session map
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmux-keeper tick

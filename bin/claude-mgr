@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""claude-mgr: see and control the Claude Code sessions on this host.
+
+Meant to be the single command a remote manager (a dashboard) may run over SSH:
+put it in authorized_keys as a forced command and the key can do nothing else.
+
+  claude-mgr status                  JSON: every session (tmux + background)
+  claude-mgr stop <id>               end a session (background: claude stop;
+                                     interactive: SIGTERM to its claude process)
+  claude-mgr pin <id> | unpin <id>   background sessions: keep running while idle
+  claude-mgr respawn <id>            restart a stopped background session
+  claude-mgr create                  JSON on stdin: {"folder", "name"?, "notes"?,
+                                     "prompt"?, "pin"?} -> new project folder +
+                                     a named background session
+
+<id> is a background session's short id (8 hex) or any session's full
+sessionId (uuid). Output is always one JSON object; exit status 0 = ok.
+
+Forced-command mode: when SSH_ORIGINAL_COMMAND is set, the verb and arguments
+come from it (parsed with shlex, allow-listed), never from a shell.
+"""
+import json, os, pwd, re, shlex, signal, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = os.path.join(HOME, ".claude")
+PINS = os.path.join(CLAUDE_DIR, "jobs/pins.json")
+SESSIONS_DIR = os.path.join(CLAUDE_DIR, "sessions")
+PROJECTS = os.environ.get("CLAUDE_MGR_PROJECTS", os.path.join(HOME, "projects"))
+SHORT = re.compile(r"^[0-9a-f]{8}$")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+FOLDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+MAX_NOTES = 20000
+MAX_PROMPT = 8000
+
+CONFIG = os.path.join(HOME, ".config/claude-mgr")
+KEEPER_INSTALLED = os.path.join(HOME, ".local/state/claude-keeper/installed.json")
+
+# `create` writes AGENTS.md from ~/.config/claude-mgr/new-project.md when it
+# exists, else this. Placeholders: {name} {date} {host} {path} {notes}.
+AGENTS_MD = """# {name}
+
+This project started as an idea captured on {date} ({host}:{path}).
+It is brand new: nothing here exists yet beyond this file.
+
+## The idea
+
+{notes}
+
+## How to start
+
+- If the notes above give specific instructions, act on them.
+- Otherwise don't start building: reply with a short summary of how you
+  understand the idea, two or three questions or options, and wait.
+- Keep this file current as the project's agent context: what it is, how to
+  run it, decisions made.
+"""
+# The first prompt; override with ~/.config/claude-mgr/new-project-prompt.txt.
+DEFAULT_PROMPT = ("Read AGENTS.md in this folder. It describes a new project idea. "
+                  "Follow any specific instructions in it; otherwise give a short summary of the idea "
+                  "with a few questions or options, and wait.")
+
+
+def config_text(name, default):
+    try:
+        with open(os.path.join(CONFIG, name)) as f:
+            text = f.read()
+        return text if text.strip() else default
+    except OSError:
+        return default
+
+
+def fill(template, **values):
+    # Plain replacement, so other braces in a custom template are left alone.
+    for k, v in values.items():
+        template = template.replace("{" + k + "}", v)
+    return template
+
+
+def out(obj, code=0):
+    print(json.dumps(obj, indent=1, sort_keys=True))
+    sys.exit(code)
+
+
+def fail(msg, code=1, **extra):
+    out({"ok": False, "error": msg, **extra}, code)
+
+
+def claude_bin():
+    local = os.path.join(HOME, ".local/bin/claude")
+    return local if os.access(local, os.X_OK) else "claude"
+
+
+def run(args, timeout=60, stdin=None):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, input=stdin)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def agents():
+    r = run([claude_bin(), "agents", "--json", "--all"])
+    if r.returncode != 0:
+        fail("claude agents --json failed", stderr=r.stderr.strip()[-300:])
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        fail("claude agents --json returned no JSON")
+
+
+def session_files():
+    """sessionId -> live per-process info (Remote Control id, tmux pane)."""
+    found = {}
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except FileNotFoundError:
+        return found
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        d = read_json(os.path.join(SESSIONS_DIR, n), None)
+        if not isinstance(d, dict) or not d.get("sessionId"):
+            continue
+        prev = found.get(d["sessionId"])
+        if prev and prev.get("updatedAt", 0) >= d.get("updatedAt", 0):
+            continue
+        found[d["sessionId"]] = d
+    return found
+
+
+def collect():
+    pins = set(read_json(PINS, []))
+    files = session_files()
+    rows = []
+    for a in agents():
+        sid = a.get("sessionId")
+        f = files.get(sid, {}) if a.get("pid") else {}
+        bridge = f.get("bridgeSessionId")
+        rows.append({
+            "id": a.get("id") or sid,
+            "shortId": a.get("id"),
+            "sessionId": sid,
+            "kind": a.get("kind"),
+            "name": a.get("name"),
+            "cwd": a.get("cwd"),
+            "status": a.get("status") if a.get("pid") else "stopped",
+            "turnState": a.get("state"),
+            "running": bool(a.get("pid")),
+            "pid": a.get("pid"),
+            "pinned": bool(a.get("id")) and a.get("id") in pins,
+            "startedAt": a.get("startedAt"),
+            "tmux": f.get("tmux"),
+            "remoteControlUrl": f"https://claude.ai/code/{bridge}" if bridge else None,
+            "claudeVersion": f.get("version"),
+        })
+    rows.sort(key=lambda r: (not r["running"], r["kind"] != "background", -(r["startedAt"] or 0)))
+    return rows
+
+
+def find(ident):
+    if not (SHORT.match(ident) or UUID.match(ident)):
+        fail("bad session id", id=ident)
+    for r in collect():
+        if ident in (r["shortId"], r["sessionId"]):
+            return r
+    fail("no such session", id=ident)
+
+
+def cmd_status(_args):
+    v = run([claude_bin(), "--version"]).stdout.strip()
+    out({"ok": True, "host": os.uname().nodename, "user": pwd.getpwuid(os.getuid()).pw_name,
+         "time": int(time.time() * 1000), "claudeVersion": v, "projectsDir": PROJECTS,
+         "keeperVersion": read_json(KEEPER_INSTALLED, {}).get("version"),
+         "sessions": collect()})
+
+
+def cmd_stop(args):
+    r = find(args[0])
+    if not r["running"]:
+        out({"ok": True, "id": r["id"], "result": "already stopped"})
+    if r["kind"] == "background":
+        p = run([claude_bin(), "stop", r["shortId"]])
+        if p.returncode != 0:
+            fail("claude stop failed", detail=(p.stdout + p.stderr).strip()[-300:])
+        # A stopped session stays out of tmux-keeper's respawn list at its next save.
+        out({"ok": True, "id": r["id"], "result": (p.stdout or "stopped").strip()})
+    pid = r["pid"]
+    try:
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        cmdline = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")[0].decode()
+    except OSError:
+        fail("process vanished", id=r["id"])
+    if "claude" not in (exe + os.path.basename(cmdline)):
+        fail("pid is not a claude process", id=r["id"], pid=pid)
+    os.kill(pid, signal.SIGTERM)
+    out({"ok": True, "id": r["id"], "result": f"sent SIGTERM to {pid}"})
+
+
+def set_pin(ident, on):
+    r = find(ident)
+    if r["kind"] != "background" or not r["shortId"]:
+        fail("only background sessions can be pinned", id=r["id"])
+    pins = [p for p in read_json(PINS, []) if isinstance(p, str)]
+    if on and r["shortId"] not in pins:
+        pins.append(r["shortId"])
+    if not on:
+        pins = [p for p in pins if p != r["shortId"]]
+    write_json(PINS, pins)
+    return r
+
+
+def cmd_pin(args):
+    r = set_pin(args[0], True)
+    out({"ok": True, "id": r["id"], "pinned": True})
+
+
+def cmd_unpin(args):
+    r = set_pin(args[0], False)
+    out({"ok": True, "id": r["id"], "pinned": False})
+
+
+def cmd_respawn(args):
+    r = find(args[0])
+    if r["kind"] != "background" or not r["shortId"]:
+        fail("only background sessions can be respawned", id=r["id"])
+    p = run([claude_bin(), "respawn", r["shortId"]], timeout=120)
+    if p.returncode != 0:
+        fail("claude respawn failed", detail=(p.stdout + p.stderr).strip()[-300:])
+    out({"ok": True, "id": r["id"], "result": p.stdout.strip()})
+
+
+def trust_folder(path):
+    """Mark a folder claude-mgr just created as trusted, the same flags the
+    trust and external-imports dialogs set. Without it `claude --bg` refuses
+    ("Workspace not trusted"). Only ever called for a folder we created."""
+    cfg = os.path.join(HOME, ".claude.json")
+    d = read_json(cfg, None)
+    if not isinstance(d, dict):
+        fail("cannot read ~/.claude.json to trust the new folder", path=path)
+    proj = d.setdefault("projects", {}).setdefault(path, {})
+    proj.update({"hasTrustDialogAccepted": True, "hasClaudeMdExternalIncludesApproved": True,
+                 "hasClaudeMdExternalIncludesWarningShown": True})
+    tmp = f"{cfg}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.chmod(tmp, os.stat(cfg).st_mode & 0o777)
+    os.replace(tmp, cfg)
+
+
+def cmd_create(_args):
+    try:
+        req = json.loads(sys.stdin.read(MAX_NOTES + MAX_PROMPT + 4096) or "{}")
+    except ValueError:
+        fail("create wants a JSON object on stdin")
+    folder = str(req.get("folder", "")).strip()
+    name = str(req.get("name") or folder).strip()
+    notes = str(req.get("notes") or "").strip()
+    prompt = str(req.get("prompt") or "").strip() or config_text("new-project-prompt.txt", DEFAULT_PROMPT).strip()
+    if not FOLDER.match(folder):
+        fail("folder: letters, digits, . _ - only (max 64), no slashes", folder=folder)
+    if not NAME.match(name):
+        fail("name: letters, digits, space . _ - (max 64)", name=name)
+    if len(notes) > MAX_NOTES or len(prompt) > MAX_PROMPT:
+        fail("notes or prompt too long")
+    path = os.path.join(PROJECTS, folder)
+    if os.path.exists(path):
+        fail("folder already exists", path=path)
+    os.makedirs(path)
+    md = fill(config_text("new-project.md", AGENTS_MD), name=name, date=time.strftime("%Y-%m-%d"),
+              host=os.uname().nodename, path=path, notes=notes or "(no notes, just the name)")
+    with open(os.path.join(path, "AGENTS.md"), "w") as f:
+        f.write(md)
+    with open(os.path.join(path, "CLAUDE.md"), "w") as f:
+        f.write("@AGENTS.md\n")
+    run(["git", "init", "-q", path])
+    trust_folder(path)
+    before = {r["shortId"] for r in collect() if r["shortId"]}
+    p = subprocess.run([claude_bin(), "--bg", "--name", name, prompt], cwd=path,
+                       capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        fail("claude --bg failed", path=path, detail=(p.stdout + p.stderr).strip()[-300:])
+    m = re.search(r"\b([0-9a-f]{8})\b", p.stdout)
+    short = m.group(1) if m else None
+    if not short:
+        new = [r for r in collect() if r["shortId"] and r["shortId"] not in before]
+        short = new[0]["shortId"] if new else None
+    pinned = False
+    if short and req.get("pin", True):
+        set_pin(short, True)
+        pinned = True
+    out({"ok": True, "path": path, "id": short, "name": name, "pinned": pinned})
+
+
+VERBS = {
+    "status": (cmd_status, 0),
+    "stop": (cmd_stop, 1),
+    "pin": (cmd_pin, 1),
+    "unpin": (cmd_unpin, 1),
+    "respawn": (cmd_respawn, 1),
+    "create": (cmd_create, 0),
+}
+
+
+def main():
+    forced = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if forced is not None:
+        try:
+            argv = shlex.split(forced)
+        except ValueError:
+            fail("unparsable command")
+        # Accept "claude-mgr status" as well as "status".
+        if argv and os.path.basename(argv[0]) == "claude-mgr":
+            argv = argv[1:]
+    else:
+        argv = sys.argv[1:]
+    if not argv or argv[0] not in VERBS:
+        fail("usage: claude-mgr {%s} [id]" % "|".join(VERBS), code=2)
+    fn, nargs = VERBS[argv[0]]
+    if len(argv) - 1 != nargs:
+        fail(f"{argv[0]} takes {nargs} argument(s)", code=2)
+    fn(argv[1:])
+
+
+if __name__ == "__main__":
+    main()
