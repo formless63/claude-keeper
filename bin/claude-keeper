@@ -70,7 +70,13 @@ cmd_update() {
   [ -n "$src" ] && [ -x "$src/install.sh" ] || die "source checkout '$src' is gone; clone it again and run its install.sh"
   if git -C "$src" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
     if [ "${1:-}" = --dry-run ]; then
-      git -C "$src" fetch -q && git -C "$src" log --oneline 'HEAD..@{u}'
+      git -C "$src" fetch -q || die "git fetch failed in $src"
+      if [ -n "$(git -C "$src" log --oneline 'HEAD..@{u}')" ]; then
+        echo "Would pull:"; git -C "$src" log --oneline 'HEAD..@{u}' | sed 's/^/  /'
+        echo "Run claude-keeper update to pull and install them."
+        return 0
+      fi
+      echo "Nothing to pull. Checking the checkout against what is installed:"
     else
       git -C "$src" pull -q --ff-only || die "git pull failed in $src (local changes or diverged history); fix it there, then rerun"
     fi

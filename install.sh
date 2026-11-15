@@ -158,6 +158,6 @@ fi
 # --- summary ---------------------------------------------------------------
 if [ "${#changed[@]}" = 0 ]; then say "Already up to date."
 else say "Changed:"; for c in "${changed[@]}"; do say "  ${c/#$HOME/~}"; done; fi
-case ":$PATH:" in *":$BIN:"*) ;; *) warn "$BIN is not on your PATH" ;; esac
+case ":$PATH:" in *":$BIN:"*) ;; *) warn "$BIN is not on PATH in this shell; add it in your shell profile" ;; esac
 if [ "${#warnings[@]}" -gt 0 ]; then say "${#warnings[@]} warning(s), see above."; fi
 [ "$DRY" = 1 ] || say "Check it with: claude-keeper status"
