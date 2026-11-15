@@ -19,6 +19,36 @@ control them.
 Per user, no root, no daemon of its own: a few systemd user units and two
 Python scripts.
 
+## Recommended workflow
+
+**Why use it:**
+
+- A reboot, a kernel update or a power cut no longer costs you your place.
+  Every project comes back in its own window, with its conversation open.
+- You keep using plain tmux and Claude Code. There is nothing new to learn
+  and nothing to remember to save.
+- Long jobs can run in the background unattended, and they come back after a
+  reboot too.
+- One restricted SSH key lets your phone or dashboard list, start, pin and
+  stop sessions, and do nothing else.
+
+**How to manage your sessions:**
+
+1. **Run Claude inside tmux, one tmux session per project**, started in the
+   project folder (`tmux new -s myproj -c ~/code/myproj`, then `claude`).
+   Name your Claude sessions (`claude -n myproj` or `/rename`) so they are
+   easy to find later.
+2. **Use background sessions (`claude --bg`, `/bg`) for work that should keep
+   going without a terminal.** They are pinned automatically so they don't
+   stop when idle.
+3. **Stop what you're finished with**: exit Claude or close the pane. Only
+   what was running at the last save comes back.
+4. **Detach, don't kill**: leave with `Ctrl-b d`. To reboot, just reboot; a
+   normal shutdown saves first. Without a clean shutdown, up to the last
+   2 minutes of changes can be lost.
+5. **Check and update now and then**: `claude-keeper status`, then
+   `claude-keeper update`.
+
 ## Requirements
 
 - Linux with systemd (user services) and lingering allowed for your user.
